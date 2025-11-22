@@ -1,17 +1,18 @@
-name: START_RDP
+name: RDP
 
 on:
+  # Cambiamos de 'workflow_dispatch' a 'repository_dispatch'
   repository_dispatch:
-    types: [start_rdp]
-
+    types: [iniciar-rdp]
 jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Enable RDP
+      - name: Configure Core RDP Settings
         run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,33 +20,41 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
 
+          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create User
+      - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-            Upper  = [char[]](65..90)
-            Lower  = [char[]](97..122)
-            Number = [char[]](48..57)
+              Upper  = [char[]](65..90)    # A-Z
+              Lower  = [char[]](97..122)    # a-z
+              Number = [char[]](48..57)    # 0-9
           }
-
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 6
           $rawPassword += $charSet.Lower | Get-Random -Count 6
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
+          
+          # Guarda la contraseña limpia en una variable de entorno
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
@@ -56,10 +65,12 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Connect to Tailscale
+      - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=winrdp-$env:GITHUB_RUN_ID
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -67,29 +78,30 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Save RDP info to artifact
-        run: |
-          $json = @{
-            ip = $env:TAILSCALE_IP
-            user = "RDP"
-            pass = $env:RDP_PASS
-          } | ConvertTo-Json -Compress
-
-          $json | Out-File -FilePath rdp_info.json -Encoding utf8
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp_info
-          path: rdp_info.json
-
-      - name: Maintain Session
-        run: |
-          Write-Host "RDP READY"
-          while ($true) {
-            Start-Sleep -Seconds 300
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          # Imprime la contraseña limpia que guardamos
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "==================`n"
